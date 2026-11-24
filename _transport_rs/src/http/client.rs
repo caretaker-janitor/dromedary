@@ -20,10 +20,10 @@ use dromedary::http::client::{
     HttpClient as RsHttpClient, HttpClientConfig, HttpResponse as RsHttpResponse,
     NegotiateProvider, RequestOptions, TokenProvider,
 };
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyTypeError, PyValueError};
 use pyo3::import_exception;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
+use pyo3::types::{PyBytes, PyList, PyMemoryView, PyString, PyTuple};
 
 import_exception!(dromedary.errors, ConnectionError);
 import_exception!(dromedary.errors, InvalidHttpResponse);
@@ -496,26 +496,49 @@ pub(super) fn extract_headers(py: Python, obj: &Py<PyAny>) -> PyResult<Vec<(Stri
     Ok(out)
 }
 
-/// Accept `bytes`, `bytearray`, `memoryview`, or `str` (encoded as
-/// UTF-8) as the request body. Matches how the Python side
-/// previously passed data to `connection._send_request`.
+/// Accept `bytes`, `bytearray`, `memoryview`, `str` (encoded as
+/// UTF-8), or an iterable of bytes-like chunks as the request body.
+/// An iterable is read in full; dulwich passes a large body that way.
 pub(super) fn extract_body(py: Python, obj: &Py<PyAny>) -> PyResult<Vec<u8>> {
     let bound = obj.bind(py);
-    if let Ok(b) = bound.cast::<PyBytes>() {
-        return Ok(b.as_bytes().to_vec());
-    }
     if let Ok(s) = bound.extract::<String>() {
         return Ok(s.into_bytes());
     }
-    // Fallback: coerce via `bytes()` (handles bytearray, memoryview).
-    let as_bytes = py
-        .get_type::<PyBytes>()
-        .call1((bound.clone(),))
+    if let Some(b) = extract_bytes_like(py, bound)? {
+        return Ok(b);
+    }
+    let chunks = bound
+        .try_iter()
         .map_err(|e| PyValueError::new_err(format!("can't interpret body as bytes: {}", e)))?;
-    let b = as_bytes
-        .cast::<PyBytes>()
-        .map_err(|e| PyValueError::new_err(format!("body coercion failed: {}", e)))?;
-    Ok(b.as_bytes().to_vec())
+    let mut out = Vec::new();
+    for chunk in chunks {
+        let chunk = chunk?;
+        match extract_bytes_like(py, &chunk)? {
+            Some(b) => out.extend_from_slice(&b),
+            None => {
+                return Err(PyValueError::new_err(format!(
+                    "body chunks must be bytes-like, not {}",
+                    chunk.get_type().name()?
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The contents of `obj` if it is `bytes` or supports the buffer
+/// protocol (`bytearray`, `memoryview`), otherwise `None`.
+fn extract_bytes_like(py: Python, obj: &Bound<PyAny>) -> PyResult<Option<Vec<u8>>> {
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        return Ok(Some(b.as_bytes().to_vec()));
+    }
+    let view = match PyMemoryView::from(obj) {
+        Ok(view) => view,
+        Err(e) if e.is_instance_of::<PyTypeError>(py) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let b = view.call_method0("tobytes")?.cast_into::<PyBytes>()?;
+    Ok(Some(b.as_bytes().to_vec()))
 }
 
 pub(crate) fn register(m: &Bound<PyModule>) -> PyResult<()> {

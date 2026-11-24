@@ -252,6 +252,57 @@ class TestTokenProviderEndToEnd(unittest.TestCase):
         self.assertIsNone(self.server.last_authorization)
 
 
+class _CaptureBodyHandler(BaseHTTPRequestHandler):
+    """HTTP handler that records the body of a POST and replies 200 OK."""
+
+    def do_POST(self):
+        length = int(self.headers["Content-Length"])
+        self.server.last_body = self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args, **kwargs):  # silence stderr noise
+        pass
+
+
+class TestRequestBody(unittest.TestCase):
+    """Check which request bodies the Rust HTTP client sends, against
+    a stdlib HTTPServer.
+    """
+
+    def setUp(self):
+        isolate_proxy_env(self)
+        self.server = HTTPServer(("127.0.0.1", 0), _CaptureBodyHandler)
+        self.server.last_body = None
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+        self.addCleanup(self._stop_server)
+
+    def _stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _url(self, path="/"):
+        host, port = self.server.server_address
+        return f"http://{host}:{port}{path}"
+
+    def test_bytes(self):
+        resp = HttpClient().request("POST", self._url(), [], b"some data")
+        self.assertEqual(200, resp.status)
+        self.assertEqual(b"some data", self.server.last_body)
+
+    def test_iterator_of_chunks(self):
+        resp = HttpClient().request(
+            "POST", self._url(), [], iter([b"some ", bytearray(b"more "), b"data"])
+        )
+        self.assertEqual(200, resp.status)
+        self.assertEqual(b"some more data", self.server.last_body)
+
+
 class _RedirectHandler(BaseHTTPRequestHandler):
     """HTTP handler driven by ``server.routes``: a path maps to a
     redirect target, to ``"challenge"`` (401 Basic until credentials
